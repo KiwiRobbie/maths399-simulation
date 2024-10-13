@@ -4,6 +4,10 @@
 //! is rendered to the screen.
 
 use bevy::{
+    core_pipeline::fullscreen_vertex_shader::{
+        self, fullscreen_shader_vertex_state, FULLSCREEN_SHADER_HANDLE,
+    },
+    input::keyboard::{Key, KeyboardInput},
     prelude::*,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
@@ -22,9 +26,11 @@ use std::borrow::Cow;
 /// This example uses a shader source file from the assets subdirectory
 const ADVECTION_SHADER_ASSET_PATH: &str = "shaders/advection.wgsl";
 const JACOBI_SHADER_ASSET_PATH: &str = "shaders/jacobi.wgsl";
+const DIVERGENCE_SHADER_ASSET_PATH: &str = "shaders/divergence.wgsl";
+const GRADIENT_SUBTRACTION_SHADER_ASSET_PATH: &str = "shaders/gradient_subtraction.wgsl";
 
 const DISPLAY_FACTOR: u32 = 1;
-const SIZE: (u32, u32) = (1280 / DISPLAY_FACTOR, 720 / DISPLAY_FACTOR);
+const SIZE: (u32, u32) = (1024 / DISPLAY_FACTOR, 1024 / DISPLAY_FACTOR);
 const WORKGROUP_SIZE: u32 = 8;
 
 fn main() {
@@ -50,8 +56,21 @@ fn main() {
             Material2dPlugin::<CustomMaterial>::default(),
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, switch_textures)
+        .add_systems(Update, keyboard)
+        .init_resource::<ResetSimulation>()
         .run();
+}
+
+#[derive(Resource, Clone, ExtractResource, Deref, DerefMut, Default)]
+struct ResetSimulation(bool);
+
+fn keyboard(mut ev_keyboard: EventReader<KeyboardInput>, mut res_reset: ResMut<ResetSimulation>) {
+    *res_reset.as_deref_mut() = false;
+    for ev in ev_keyboard.read() {
+        if ev.key_code == KeyCode::KeyR {
+            *res_reset.as_deref_mut() = true;
+        }
+    }
 }
 
 fn setup(
@@ -60,7 +79,7 @@ fn setup(
     mut materials: ResMut<Assets<CustomMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let mut image = Image::new_fill(
+    let mut scalar_image = Image::new_fill(
         Extent3d {
             width: SIZE.0,
             height: SIZE.1,
@@ -71,12 +90,12 @@ fn setup(
         TextureFormat::R32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    image.texture_descriptor.usage =
+    scalar_image.texture_descriptor.usage =
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let image0 = images.add(image.clone());
-    let image1 = images.add(image);
+    let image0 = images.add(scalar_image.clone());
+    let image1 = images.add(scalar_image.clone());
 
-    let mut velocity_image = Image::new_fill(
+    let mut vector_image = Image::new_fill(
         Extent3d {
             width: SIZE.0,
             height: SIZE.1,
@@ -87,31 +106,27 @@ fn setup(
         TextureFormat::Rg32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    velocity_image.texture_descriptor.usage =
+    vector_image.texture_descriptor.usage =
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
 
-    let velocity0 = images.add(velocity_image.clone());
-    let velocity1 = images.add(velocity_image);
+    let velocity0 = images.add(vector_image.clone());
+    let velocity1 = images.add(vector_image.clone());
+    let pressure0: Handle<Image> = images.add(vector_image.clone());
+    let pressure1 = images.add(vector_image.clone());
+    let divergence = images.add(vector_image);
 
     commands.spawn(MaterialMesh2dBundle {
         // material: materials.add(Color::WHITE),
         mesh: Mesh2dHandle(meshes.add(Rectangle::new(SIZE.0 as f32, SIZE.1 as f32))),
         material: materials.add(CustomMaterial {
-            color: LinearRgba::RED,
-            color_texture: velocity0.clone(),
+            color_texture: image0.clone(),
+            velocity_texture: velocity0.clone(),
+            pressure_texture: pressure0.clone(),
+            divergence_texture: divergence.clone(),
         }),
         ..Default::default()
     });
 
-    // commands.spawn(SpriteBundle {
-    //     sprite: Sprite {
-    //         custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
-    //         ..default()
-    //     },
-    //     texture: velocity0.clone(),
-    //     transform: Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
-    //     ..default()
-    // });
     commands.spawn(Camera2dBundle::default());
 
     commands.insert_resource(GameOfLifeImages {
@@ -119,24 +134,17 @@ fn setup(
         texture_b: image1,
     });
     commands.insert_resource(FluidSimulationParameters {
-        time_step: 0.01,
-        grid_step: 0.01,
-        viscosity: 100.0,
+        time_step: 0.025,
+        grid_step: 0.02,
+        viscosity: 0.001,
     });
     commands.insert_resource(FluidSimulationImages {
         velocity_a: velocity0,
         velocity_b: velocity1,
+        pressure_a: pressure0,
+        pressure_b: pressure1,
+        divergence,
     });
-}
-
-// Switch texture to display every frame to show the one that was written to most recently.
-fn switch_textures(images: Res<FluidSimulationImages>, mut displayed: Query<&mut Handle<Image>>) {
-    // let mut displayed = displayed.single_mut();
-    // if *displayed == images.velocity_a {
-    //     *displayed = images.velocity_b.clone_weak();
-    // } else {
-    //     *displayed = images.velocity_a.clone_weak();
-    // }
 }
 
 struct GameOfLifeComputePlugin;
@@ -148,9 +156,13 @@ impl Plugin for GameOfLifeComputePlugin {
     fn build(&self, app: &mut App) {
         // Extract the game of life image resource from the main world into the render world
         // for operation on by the compute shader and display on the sprite.
-        app.add_plugins(ExtractResourcePlugin::<GameOfLifeImages>::default());
-        app.add_plugins(ExtractResourcePlugin::<FluidSimulationImages>::default());
-        app.add_plugins(ExtractResourcePlugin::<FluidSimulationParameters>::default());
+        app.add_plugins((
+            ExtractResourcePlugin::<GameOfLifeImages>::default(),
+            ExtractResourcePlugin::<FluidSimulationImages>::default(),
+            ExtractResourcePlugin::<FluidSimulationParameters>::default(),
+            ExtractResourcePlugin::<ResetSimulation>::default(),
+        ));
+
         let render_app = app.sub_app_mut(RenderApp);
         render_app.add_systems(
             Render,
@@ -191,28 +203,28 @@ pub struct JacobiUniform {
 
 #[derive(Resource)]
 struct FluidSimulationUniforms {
-    advection: UniformBuffer<AdvectionUniform>,
+    general: UniformBuffer<GeneralUniform>,
     pressure: UniformBuffer<JacobiUniform>,
     diffusion: UniformBuffer<JacobiUniform>,
 }
 
-impl FromWorld for FluidSimulationUniforms {
-    fn from_world(world: &mut World) -> Self {
+impl Default for FluidSimulationUniforms {
+    fn default() -> Self {
         let mut advection = UniformBuffer::default();
         advection.set_label(Some("advection_uniforms_buffer"));
 
         let mut pressure = UniformBuffer::default();
-        advection.set_label(Some("pressure_uniforms_buffer"));
+        pressure.set_label(Some("pressure_uniforms_buffer"));
 
         let mut diffusion = UniformBuffer::default();
-        advection.set_label(Some("diffusion_uniforms_buffer"));
+        diffusion.set_label(Some("diffusion_uniforms_buffer"));
 
         advection.add_usages(BufferUsages::UNIFORM);
         pressure.add_usages(BufferUsages::UNIFORM);
         diffusion.add_usages(BufferUsages::UNIFORM);
 
         Self {
-            advection,
+            general: advection,
             pressure,
             diffusion,
         }
@@ -223,23 +235,32 @@ impl FromWorld for FluidSimulationUniforms {
 struct FluidSimulationImages {
     velocity_a: Handle<Image>,
     velocity_b: Handle<Image>,
+    divergence: Handle<Image>,
+    pressure_a: Handle<Image>,
+    pressure_b: Handle<Image>,
 }
 
 #[derive(Component, ShaderType, Clone, Default)]
-pub struct AdvectionUniform {
+pub struct GeneralUniform {
     pub time_step: f32,
+    pub half_rdx: f32,
+    pub grid_step: f32,
 }
 
 #[derive(Resource)]
 struct FluidSimulationBindGroups {
-    advection_uniform: BindGroup,
+    general_uniform: BindGroup,
     advection_image: [BindGroup; 2],
+
+    diffusion_uniform: BindGroup,
+    diffusion_image: [BindGroup; 2],
+
+    divergence_image: [BindGroup; 2],
 
     pressure_uniform: BindGroup,
     pressure_image: [BindGroup; 2],
 
-    diffusion_uniform: BindGroup,
-    diffusion_image: [BindGroup; 2],
+    gradient_subtraction_image: [BindGroup; 2],
 }
 
 fn prepare_uniforms(
@@ -248,8 +269,10 @@ fn prepare_uniforms(
     mut fluid_simulation_uniforms: ResMut<FluidSimulationUniforms>,
     parameters: Res<FluidSimulationParameters>,
 ) {
-    fluid_simulation_uniforms.advection.set(AdvectionUniform {
+    fluid_simulation_uniforms.general.set(GeneralUniform {
         time_step: parameters.time_step,
+        grid_step: parameters.grid_step,
+        half_rdx: 0.5 / parameters.grid_step,
     });
 
     let dx = parameters.grid_step;
@@ -267,7 +290,7 @@ fn prepare_uniforms(
     });
 
     fluid_simulation_uniforms
-        .advection
+        .general
         .write_buffer(&render_device, &render_queue);
     fluid_simulation_uniforms
         .pressure
@@ -289,8 +312,8 @@ fn prepare_bind_group(
     // Uniform Bing Groups
     let advection_uniform_bind_group = render_device.create_bind_group(
         None,
-        &pipeline.advection_uniform_bind_group_layout,
-        &BindGroupEntries::single(uniforms.advection.into_binding()),
+        &pipeline.general_uniform_bind_group_layout,
+        &BindGroupEntries::single(uniforms.general.into_binding()),
     );
     let pressure_uniform_bind_group = render_device.create_bind_group(
         None,
@@ -304,18 +327,22 @@ fn prepare_bind_group(
         &BindGroupEntries::single(uniforms.diffusion.into_binding()),
     );
 
-    // Advection
-    let view_buffer_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
-    let view_buffer_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
+    let color_buffer_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
+    let color_buffer_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
     let velocity_buffer_a = gpu_images.get(&fluid_simulation_images.velocity_a).unwrap();
     let velocity_buffer_b = gpu_images.get(&fluid_simulation_images.velocity_b).unwrap();
+    let divergence_buffer = gpu_images.get(&fluid_simulation_images.divergence).unwrap();
+    let pressure_buffer_a = gpu_images.get(&fluid_simulation_images.pressure_a).unwrap();
+    let pressure_buffer_b = gpu_images.get(&fluid_simulation_images.pressure_b).unwrap();
+
+    // Advection (Prime -> Off-prime)
     let advection_image_bind_groups = [
         render_device.create_bind_group(
             None,
             &pipeline.advection_image_group_layout,
             &BindGroupEntries::sequential((
-                &view_buffer_a.texture_view,
-                &view_buffer_b.texture_view,
+                &color_buffer_a.texture_view,
+                &color_buffer_b.texture_view,
                 &velocity_buffer_a.texture_view,
                 &velocity_buffer_b.texture_view,
             )),
@@ -324,88 +351,141 @@ fn prepare_bind_group(
             None,
             &pipeline.advection_image_group_layout,
             &BindGroupEntries::sequential((
-                &view_buffer_b.texture_view,
-                &view_buffer_a.texture_view,
+                &color_buffer_b.texture_view,
+                &color_buffer_a.texture_view,
                 &velocity_buffer_b.texture_view,
                 &velocity_buffer_a.texture_view,
             )),
         ),
     ];
 
-    // Pressure
-    let pressure_image_bind_groups = [
-        render_device.create_bind_group(
-            None,
-            &pipeline.jacobi_image_bind_group_layout,
-            &BindGroupEntries::sequential((
-                &velocity_buffer_a.texture_view,
-                &velocity_buffer_a.texture_view,
-                &velocity_buffer_b.texture_view,
-            )),
-        ),
-        render_device.create_bind_group(
-            None,
-            &pipeline.jacobi_image_bind_group_layout,
-            &BindGroupEntries::sequential((
-                &velocity_buffer_b.texture_view,
-                &velocity_buffer_b.texture_view,
-                &velocity_buffer_a.texture_view,
-            )),
-        ),
-    ];
-
-    // Diffusion
+    // Diffusion (Off-prime first)
     let diffusion_image_bind_groups = [
         render_device.create_bind_group(
             None,
             &pipeline.jacobi_image_bind_group_layout,
             &BindGroupEntries::sequential((
-                &velocity_buffer_a.texture_view,
-                &velocity_buffer_a.texture_view,
                 &velocity_buffer_b.texture_view,
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
             )),
         ),
         render_device.create_bind_group(
             None,
             &pipeline.jacobi_image_bind_group_layout,
             &BindGroupEntries::sequential((
-                &velocity_buffer_b.texture_view,
-                &velocity_buffer_b.texture_view,
                 &velocity_buffer_a.texture_view,
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_b.texture_view,
             )),
         ),
     ];
+    // Divergence (Off-prime first)
+    let divergence_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.divergence_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_b.texture_view,
+                &divergence_buffer.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.divergence_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_a.texture_view,
+                &divergence_buffer.texture_view,
+            )),
+        ),
+    ];
+
+    // Pressure (Own buffers)
+    let pressure_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &pressure_buffer_a.texture_view,
+                &divergence_buffer.texture_view,
+                &pressure_buffer_b.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &pressure_buffer_b.texture_view,
+                &divergence_buffer.texture_view,
+                &pressure_buffer_a.texture_view,
+            )),
+        ),
+    ];
+
+    // Gradient Subtraction (Velocity: Off-prime -> Prime, Pressure: Off-prime)
+    let gradient_subtraction_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.gradient_subtraction_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_b.texture_view,
+                &color_buffer_b.texture_view,
+                &pressure_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
+                &color_buffer_a.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.gradient_subtraction_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_a.texture_view,
+                &color_buffer_a.texture_view,
+                &pressure_buffer_b.texture_view,
+                &velocity_buffer_b.texture_view,
+                &color_buffer_b.texture_view,
+            )),
+        ),
+    ];
+
     commands.insert_resource(FluidSimulationBindGroups {
-        advection_uniform: advection_uniform_bind_group,
+        general_uniform: advection_uniform_bind_group,
         advection_image: advection_image_bind_groups,
-        pressure_uniform: pressure_uniform_bind_group,
-        pressure_image: pressure_image_bind_groups,
         diffusion_uniform: diffusion_uniform_bind_group,
         diffusion_image: diffusion_image_bind_groups,
+        divergence_image: divergence_image_bind_groups,
+        pressure_uniform: pressure_uniform_bind_group,
+        pressure_image: pressure_image_bind_groups,
+        gradient_subtraction_image: gradient_subtraction_image_bind_groups,
     })
 }
 
 #[derive(Resource)]
 struct FluidSimulationPipeline {
-    advection_uniform_bind_group_layout: BindGroupLayout,
+    general_uniform_bind_group_layout: BindGroupLayout,
     advection_image_group_layout: BindGroupLayout,
     jacobi_uniform_bind_group_layout: BindGroupLayout,
     jacobi_image_bind_group_layout: BindGroupLayout,
+    divergence_image_bind_group_layout: BindGroupLayout,
+    gradient_subtraction_image_bind_group_layout: BindGroupLayout,
+
     init_pipeline: CachedComputePipelineId,
     advection_pipeline: CachedComputePipelineId,
-    pressure_pipeline: CachedComputePipelineId,
     diffusion_pipeline: CachedComputePipelineId,
+    divergence_pipeline: CachedComputePipelineId,
+    pressure_pipeline: CachedComputePipelineId,
+    gradient_subtraction_pipeline: CachedComputePipelineId,
 }
 
 impl FromWorld for FluidSimulationPipeline {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
 
-        let advection_uniform_bind_group_layout = render_device.create_bind_group_layout(
+        let general_uniform_bind_group_layout = render_device.create_bind_group_layout(
             "AdvectionUniformLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (uniform_buffer::<AdvectionUniform>(false),),
+                (uniform_buffer::<GeneralUniform>(false),),
             ),
         );
         let jacobi_uniform_bind_group_layout = render_device.create_bind_group_layout(
@@ -416,38 +496,49 @@ impl FromWorld for FluidSimulationPipeline {
             ),
         );
 
+        let r_read = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly);
+        let r_write = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly);
+
+        let rg_read = texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly);
+        let rg_write =
+            texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly);
+
         let advection_image_group_layout = render_device.create_bind_group_layout(
             "AdvectionImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
-                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
-                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly),
-                ),
+                (r_read, r_write, rg_read, rg_write),
             ),
         );
         let jacobi_image_bind_group_layout = render_device.create_bind_group_layout(
             "JacobiImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (
-                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
-                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
-                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly),
-                ),
+                (rg_read, rg_read, rg_write),
+            ),
+        );
+        let divergence_image_bind_group_layout = render_device.create_bind_group_layout(
+            "DiffusionImageLayout",
+            &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rg_read, rg_write)),
+        );
+        let gradient_subtraction_image_bind_group_layout = render_device.create_bind_group_layout(
+            "GradientSubtractionImageLayout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (rg_read, r_read, rg_read, rg_write, r_write),
             ),
         );
 
         let advection_shader = world.load_asset(ADVECTION_SHADER_ASSET_PATH);
         let jacobi_shader = world.load_asset(JACOBI_SHADER_ASSET_PATH);
+        let divergence_shader = world.load_asset(DIVERGENCE_SHADER_ASSET_PATH);
+        let gradient_subtraction_shader = world.load_asset(GRADIENT_SUBTRACTION_SHADER_ASSET_PATH);
 
         let pipeline_cache = world.resource::<PipelineCache>();
         let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
             layout: vec![
-                advection_uniform_bind_group_layout.clone(),
+                general_uniform_bind_group_layout.clone(),
                 advection_image_group_layout.clone(),
             ],
             push_constant_ranges: Vec::new(),
@@ -458,24 +549,13 @@ impl FromWorld for FluidSimulationPipeline {
         let advection_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
             layout: vec![
-                advection_uniform_bind_group_layout.clone(),
+                general_uniform_bind_group_layout.clone(),
                 advection_image_group_layout.clone(),
             ],
             push_constant_ranges: Vec::new(),
             shader: advection_shader,
             shader_defs: vec![],
             entry_point: Cow::from("advect"),
-        });
-        let pressure_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![
-                jacobi_uniform_bind_group_layout.clone(),
-                jacobi_image_bind_group_layout.clone(),
-            ],
-            push_constant_ranges: Vec::new(),
-            shader: jacobi_shader.clone(),
-            shader_defs: vec![],
-            entry_point: Cow::from("jacobi"),
         });
         let diffusion_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
@@ -488,15 +568,54 @@ impl FromWorld for FluidSimulationPipeline {
             shader_defs: vec![],
             entry_point: Cow::from("jacobi"),
         });
+        let divergence_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: None,
+                layout: vec![
+                    general_uniform_bind_group_layout.clone(),
+                    divergence_image_bind_group_layout.clone(),
+                ],
+                push_constant_ranges: Vec::new(),
+                shader: divergence_shader.clone(),
+                shader_defs: vec![],
+                entry_point: Cow::from("divergence"),
+            });
+        let pressure_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: None,
+            layout: vec![
+                jacobi_uniform_bind_group_layout.clone(),
+                jacobi_image_bind_group_layout.clone(),
+            ],
+            push_constant_ranges: Vec::new(),
+            shader: jacobi_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Cow::from("jacobi"),
+        });
+        let gradient_subtraction_pipeline =
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: None,
+                layout: vec![
+                    general_uniform_bind_group_layout.clone(),
+                    gradient_subtraction_image_bind_group_layout.clone(),
+                ],
+                push_constant_ranges: Vec::new(),
+                shader: gradient_subtraction_shader.clone(),
+                shader_defs: vec![],
+                entry_point: Cow::from("gradient_subtraction"),
+            });
         FluidSimulationPipeline {
-            advection_uniform_bind_group_layout,
+            general_uniform_bind_group_layout,
             advection_image_group_layout,
             jacobi_image_bind_group_layout,
             jacobi_uniform_bind_group_layout,
+            divergence_image_bind_group_layout,
+            gradient_subtraction_image_bind_group_layout,
             init_pipeline,
             advection_pipeline,
             diffusion_pipeline,
+            divergence_pipeline,
             pressure_pipeline,
+            gradient_subtraction_pipeline,
         }
     }
 }
@@ -521,6 +640,7 @@ impl Default for GameOfLifeNode {
 
 impl render_graph::Node for GameOfLifeNode {
     fn update(&mut self, world: &mut World) {
+        let ResetSimulation(reset) = world.resource::<ResetSimulation>();
         let pipeline = world.resource::<FluidSimulationPipeline>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
@@ -544,13 +664,12 @@ impl render_graph::Node for GameOfLifeNode {
                     self.state = GameOfLifeState::Update(1);
                 }
             }
-            GameOfLifeState::Update(0) => {
-                self.state = GameOfLifeState::Update(1);
+            GameOfLifeState::Update(index) => {
+                self.state = GameOfLifeState::Update(1 - index);
+                if *reset {
+                    self.state = GameOfLifeState::Init;
+                }
             }
-            GameOfLifeState::Update(1) => {
-                self.state = GameOfLifeState::Update(0);
-            }
-            GameOfLifeState::Update(_) => unreachable!(),
         }
     }
 
@@ -571,42 +690,90 @@ impl render_graph::Node for GameOfLifeNode {
         match self.state {
             GameOfLifeState::Loading => {}
             GameOfLifeState::Init => {
-                let init_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.init_pipeline)
-                    .unwrap();
-                pass.set_bind_group(0, &bind_groups.advection_uniform, &[]);
+                let Some(init_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.init_pipeline)
+                else {
+                    return Ok(());
+                };
+
+                pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
                 pass.set_bind_group(1, &bind_groups.advection_image[0], &[]);
                 pass.set_pipeline(init_pipeline);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
             GameOfLifeState::Update(index) => {
-                let advection_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.advection_pipeline)
-                    .unwrap();
+                let index = 1;
+                // Advection
+                let Some(advection_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.advection_pipeline)
+                else {
+                    return Ok(());
+                };
+
                 pass.set_pipeline(advection_pipeline);
+                pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
 
-                pass.set_bind_group(0, &bind_groups.advection_uniform, &[]);
-
-                pass.set_bind_group(1, &bind_groups.advection_image[1], &[]);
+                // prime -> off-prime
+                pass.set_bind_group(1, &bind_groups.advection_image[index], &[]);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
 
-                pass.set_bind_group(1, &bind_groups.advection_image[0], &[]);
-                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                let Some(diffusion_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.diffusion_pipeline)
+                else {
+                    return Ok(());
+                };
 
-                let diffusion_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.diffusion_pipeline)
-                    .unwrap();
                 pass.set_pipeline(diffusion_pipeline);
-
                 pass.set_bind_group(0, &bind_groups.diffusion_uniform, &[]);
 
-                for _ in 0..20 {
-                    pass.set_bind_group(1, &bind_groups.diffusion_image[1], &[]);
+                // Iterate diffusion, result in off-prime buffer
+                for _ in 0..50 {
+                    // off-prime -> prime
+                    pass.set_bind_group(1, &bind_groups.diffusion_image[index], &[]);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
 
-                    pass.set_bind_group(1, &bind_groups.diffusion_image[0], &[]);
+                    // prime -> off-prime
+                    pass.set_bind_group(1, &bind_groups.diffusion_image[1 - index], &[]);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
                 }
+
+                // Divergence
+                let Some(divergence_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.divergence_pipeline)
+                else {
+                    return Ok(());
+                };
+
+                pass.set_pipeline(divergence_pipeline);
+                pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
+                pass.set_bind_group(1, &bind_groups.divergence_image[index], &[]);
+                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                // Pressure
+                let Some(pressure_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.pressure_pipeline)
+                else {
+                    return Ok(());
+                };
+
+                pass.set_pipeline(pressure_pipeline);
+                pass.set_bind_group(0, &bind_groups.pressure_uniform, &[]);
+                for j in 0usize..100usize {
+                    pass.set_bind_group(1, &bind_groups.pressure_image[j.rem_euclid(2)], &[]);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
+
+                // Gradient Subtraction
+                let Some(gradient_subtraction_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.gradient_subtraction_pipeline)
+                else {
+                    return Ok(());
+                };
+
+                pass.set_pipeline(gradient_subtraction_pipeline);
+                pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
+                pass.set_bind_group(1, &bind_groups.gradient_subtraction_image[index], &[]);
+                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
         }
 
@@ -616,15 +783,21 @@ impl render_graph::Node for GameOfLifeNode {
 
 #[derive(AsBindGroup, Debug, Clone, Asset, TypePath)]
 pub struct CustomMaterial {
-    // Uniform bindings must implement `ShaderType`, which will be used to convert the value to
-    // its shader-compatible equivalent. Most core math types already implement `ShaderType`.
-    #[uniform(0)]
-    color: LinearRgba,
-    // Images can be bound as textures in shaders. If the Image's sampler is also needed, just
-    // add the sampler attribute with a different binding index.
-    #[texture(1)]
-    #[sampler(2)]
+    #[texture(0)]
+    #[sampler(1)]
+    velocity_texture: Handle<Image>,
+
+    #[texture(2)]
+    #[sampler(3)]
     color_texture: Handle<Image>,
+
+    #[texture(4)]
+    #[sampler(5)]
+    pressure_texture: Handle<Image>,
+
+    #[texture(6)]
+    #[sampler(7)]
+    divergence_texture: Handle<Image>,
 }
 
 // All functions on `Material2d` have default impls. You only need to implement the

@@ -1,10 +1,10 @@
-// The shader reads the previous frame's state from the `input` texture, and writes the new state of
-// each pixel to the `output` texture. The textures are flipped each step to progress the
-// simulation.
-// Two textures are needed for the game of life as each pixel of step N depends on the state of its
-// neighbors at step N-1.
+struct GeneralUniform {
+    time_step: f32,
+    half_rdx: f32,
+    grid_step: f32,
+}
 
-@group(0) @binding(0) var<uniform> time_step: f32;
+@group(0) @binding(0) var<uniform> uniforms: GeneralUniform;
 
 @group(1) @binding(0) var input: texture_storage_2d<r32float, read>;
 @group(1) @binding(1) var output: texture_storage_2d<r32float, write>;
@@ -32,17 +32,32 @@ fn init(@builtin(global_invocation_id) invocation_id: vec3<u32>, @builtin(num_wo
     let location = vec2<i32>(i32(invocation_id.x), i32(invocation_id.y));
 
     let randomNumber = randomFloat(invocation_id.y << 16u | invocation_id.x);
-    let alive = randomNumber > 0.9;
-    let color = vec4<f32>(f32(alive));
+    let alive = randomNumber > 0.925;
+    let color = 0.0 * vec4<f32>(f32(alive));
 
-    let uv = vec2<f32>(
+    let uv = 2.0 * vec2<f32>(
         f32(location.x) / f32(textureDimensions(velocity_output).x),
         f32(location.y) / f32(textureDimensions(velocity_output).y),
-    );
+    ) - 1.0;
+    let x = randomFloat(invocation_id.y << 16u | invocation_id.x + 282873452);
+    let y = randomFloat(invocation_id.y << 16u | invocation_id.x + 178712234);
+    let rand = vec2<f32>(x - 0.5, y - 0.5) * 2.0;
 
 
-    let velocity = 1.0 * vec2<f32>(0.0, 2.0 * round(uv.x) - 1.0);
+    
+    // let speed = 1000.0 * (uv - vec2<f32>(0.5));
+    // let velocity = vec2<f32>(speed.y, -speed.x);
 
+    // let velocity = 100.0 * vec2<f32>(2.0 * x - 1.0, 2.0 * round(uv.x) - 1.0);
+    // let velocity = vec2<f32>(1000.0);
+
+    let coord = 2.0 * fract(uv) - 1.0;
+    let velocity = 500.0 * vec2<f32>(0.0, sign(uv.x)) * f32(dot(coord, coord) < 0.1) + 200.0 * rand;
+
+
+
+
+    // let velocity = vec2<f32>(0.0) + vec2<f32>(200.0, 0.0) * f32(dot(2.0 * uv - 1.0, 2.0 * uv - 1.0) < 0.1 * 0.1);
     textureStore(output, location, color);
     textureStore(velocity_output, location, vec4<f32>(velocity.x, velocity.y, 0.0, 0.0));
 }
@@ -129,31 +144,12 @@ fn advect(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
 
     // Advection 
     let velocity = textureLoad(velocity_input, location).xy;
-    let advection_source = vec2<f32>(f32(location.x), f32(location.y)) - time_step * velocity.xy;
+    let advection_source = vec2<f32>(f32(location.x), f32(location.y)) - uniforms.time_step * velocity.xy;
 
 
     let advected_color = bilinear_sample_x(input, advection_source);
     let advected_velocity = bilinear_sample_xy(velocity_input, advection_source).xy;
     textureStore(output, location, vec4<f32>(advected_color));
     textureStore(velocity_output, location, vec4<f32>(advected_velocity.x, advected_velocity.y, 0.0, 0.0));
-
-    // let velocity 
-    // ??? 
-    
-    // ???
-    // let n_alive = count_alive(location);
-
-    // var alive: bool;
-    // if n_alive == 3 {
-    //     alive = true;
-    // } else if n_alive == 2 {
-    //     let currently_alive = is_alive(location, 0, 0);
-    //     alive = bool(currently_alive);
-    // } else {
-    //     alive = false;
-    // }
-    // let color = vec4<f32>(f32(alive));
-
-    // textureStore(output, location, color);
 }
 
