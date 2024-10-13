@@ -14,6 +14,7 @@ use bevy::{
         texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
+    sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle, Mesh2dHandle},
 };
 use binding_types::uniform_buffer;
 use std::borrow::Cow;
@@ -22,7 +23,7 @@ use std::borrow::Cow;
 const ADVECTION_SHADER_ASSET_PATH: &str = "shaders/advection.wgsl";
 const JACOBI_SHADER_ASSET_PATH: &str = "shaders/jacobi.wgsl";
 
-const DISPLAY_FACTOR: u32 = 4;
+const DISPLAY_FACTOR: u32 = 1;
 const SIZE: (u32, u32) = (1280 / DISPLAY_FACTOR, 720 / DISPLAY_FACTOR);
 const WORKGROUP_SIZE: u32 = 8;
 
@@ -46,13 +47,19 @@ fn main() {
                 })
                 .set(ImagePlugin::default_nearest()),
             GameOfLifeComputePlugin,
+            Material2dPlugin::<CustomMaterial>::default(),
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, switch_textures)
         .run();
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<CustomMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     let mut image = Image::new_fill(
         Extent3d {
             width: SIZE.0,
@@ -86,15 +93,25 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let velocity0 = images.add(velocity_image.clone());
     let velocity1 = images.add(velocity_image);
 
-    commands.spawn(SpriteBundle {
-        sprite: Sprite {
-            custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
-            ..default()
-        },
-        texture: image0.clone(),
-        transform: Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
-        ..default()
+    commands.spawn(MaterialMesh2dBundle {
+        // material: materials.add(Color::WHITE),
+        mesh: Mesh2dHandle(meshes.add(Rectangle::new(SIZE.0 as f32, SIZE.1 as f32))),
+        material: materials.add(CustomMaterial {
+            color: LinearRgba::RED,
+            color_texture: velocity0.clone(),
+        }),
+        ..Default::default()
     });
+
+    // commands.spawn(SpriteBundle {
+    //     sprite: Sprite {
+    //         custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
+    //         ..default()
+    //     },
+    //     texture: velocity0.clone(),
+    //     transform: Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
+    //     ..default()
+    // });
     commands.spawn(Camera2dBundle::default());
 
     commands.insert_resource(GameOfLifeImages {
@@ -102,9 +119,9 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         texture_b: image1,
     });
     commands.insert_resource(FluidSimulationParameters {
-        time_step: 1.0,
-        grid_step: 1.0,
-        viscosity: 1.0,
+        time_step: 0.01,
+        grid_step: 0.01,
+        viscosity: 100.0,
     });
     commands.insert_resource(FluidSimulationImages {
         velocity_a: velocity0,
@@ -113,13 +130,13 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 }
 
 // Switch texture to display every frame to show the one that was written to most recently.
-fn switch_textures(images: Res<GameOfLifeImages>, mut displayed: Query<&mut Handle<Image>>) {
-    let mut displayed = displayed.single_mut();
-    if *displayed == images.texture_a {
-        *displayed = images.texture_b.clone_weak();
-    } else {
-        *displayed = images.texture_a.clone_weak();
-    }
+fn switch_textures(images: Res<FluidSimulationImages>, mut displayed: Query<&mut Handle<Image>>) {
+    // let mut displayed = displayed.single_mut();
+    // if *displayed == images.velocity_a {
+    //     *displayed = images.velocity_b.clone_weak();
+    // } else {
+    //     *displayed = images.velocity_a.clone_weak();
+    // }
 }
 
 struct GameOfLifeComputePlugin;
@@ -165,9 +182,6 @@ struct FluidSimulationParameters {
     grid_step: f32,
     viscosity: f32,
 }
-
-struct PoissonPressureBindGroups([BindGroup; 2]);
-struct PoissonDiffusionBindGroups([BindGroup; 2]);
 
 #[derive(Component, ShaderType, Clone, Default)]
 pub struct JacobiUniform {
@@ -217,9 +231,6 @@ pub struct AdvectionUniform {
 }
 
 #[derive(Resource)]
-struct SimulationDataBindGroups(BindGroup);
-
-#[derive(Resource)]
 struct FluidSimulationBindGroups {
     advection_uniform: BindGroup,
     advection_image: [BindGroup; 2],
@@ -237,6 +248,10 @@ fn prepare_uniforms(
     mut fluid_simulation_uniforms: ResMut<FluidSimulationUniforms>,
     parameters: Res<FluidSimulationParameters>,
 ) {
+    fluid_simulation_uniforms.advection.set(AdvectionUniform {
+        time_step: parameters.time_step,
+    });
+
     let dx = parameters.grid_step;
     let dt = parameters.time_step;
     let pressure_alpha = -dx * dx;
@@ -418,7 +433,7 @@ impl FromWorld for FluidSimulationPipeline {
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
                     texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
                     texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly),
                 ),
@@ -545,15 +560,13 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let data_bind_group = &world.resource::<SimulationDataBindGroups>().0;
-        let image_bind_groups = &world.resource::<SimulationImageBindGroups>().0;
+        let bind_groups = &world.resource::<FluidSimulationBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<FluidSimulationPipeline>();
 
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-
+        let encoder = render_context.command_encoder();
+        let mut pass: ComputePass<'_> =
+            encoder.begin_compute_pass(&ComputePassDescriptor::default());
         // select the pipeline based on the current state
         match self.state {
             GameOfLifeState::Loading => {}
@@ -561,26 +574,63 @@ impl render_graph::Node for GameOfLifeNode {
                 let init_pipeline = pipeline_cache
                     .get_compute_pipeline(pipeline.init_pipeline)
                     .unwrap();
-                pass.set_bind_group(0, &data_bind_group, &[]);
-                pass.set_bind_group(1, &image_bind_groups[0], &[]);
+                pass.set_bind_group(0, &bind_groups.advection_uniform, &[]);
+                pass.set_bind_group(1, &bind_groups.advection_image[0], &[]);
                 pass.set_pipeline(init_pipeline);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
             GameOfLifeState::Update(index) => {
-                let update_pipeline = pipeline_cache
+                let advection_pipeline = pipeline_cache
                     .get_compute_pipeline(pipeline.advection_pipeline)
                     .unwrap();
-                pass.set_pipeline(update_pipeline);
+                pass.set_pipeline(advection_pipeline);
 
-                pass.set_bind_group(0, &data_bind_group, &[]);
-                pass.set_bind_group(1, &image_bind_groups[1], &[]);
+                pass.set_bind_group(0, &bind_groups.advection_uniform, &[]);
+
+                pass.set_bind_group(1, &bind_groups.advection_image[1], &[]);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
 
-                pass.set_bind_group(1, &image_bind_groups[0], &[]);
+                pass.set_bind_group(1, &bind_groups.advection_image[0], &[]);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                let diffusion_pipeline = pipeline_cache
+                    .get_compute_pipeline(pipeline.diffusion_pipeline)
+                    .unwrap();
+                pass.set_pipeline(diffusion_pipeline);
+
+                pass.set_bind_group(0, &bind_groups.diffusion_uniform, &[]);
+
+                for _ in 0..20 {
+                    pass.set_bind_group(1, &bind_groups.diffusion_image[1], &[]);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                    pass.set_bind_group(1, &bind_groups.diffusion_image[0], &[]);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
             }
         }
 
         Ok(())
+    }
+}
+
+#[derive(AsBindGroup, Debug, Clone, Asset, TypePath)]
+pub struct CustomMaterial {
+    // Uniform bindings must implement `ShaderType`, which will be used to convert the value to
+    // its shader-compatible equivalent. Most core math types already implement `ShaderType`.
+    #[uniform(0)]
+    color: LinearRgba,
+    // Images can be bound as textures in shaders. If the Image's sampler is also needed, just
+    // add the sampler attribute with a different binding index.
+    #[texture(1)]
+    #[sampler(2)]
+    color_texture: Handle<Image>,
+}
+
+// All functions on `Material2d` have default impls. You only need to implement the
+// functions that are relevant for your material.
+impl Material2d for CustomMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/custom_material.wgsl".into()
     }
 }

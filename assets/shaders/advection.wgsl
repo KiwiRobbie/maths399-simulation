@@ -35,8 +35,16 @@ fn init(@builtin(global_invocation_id) invocation_id: vec3<u32>, @builtin(num_wo
     let alive = randomNumber > 0.9;
     let color = vec4<f32>(f32(alive));
 
+    let uv = vec2<f32>(
+        f32(location.x) / f32(textureDimensions(velocity_output).x),
+        f32(location.y) / f32(textureDimensions(velocity_output).y),
+    );
+
+
+    let velocity = 1.0 * vec2<f32>(0.0, 2.0 * round(uv.x) - 1.0);
+
     textureStore(output, location, color);
-    textureStore(velocity_output, location, vec4<f32>(0.0, (f32(location.x) - 0.5 * f32(textureDimensions(velocity_output).x)) * 0.001, 0.0, 0.0));
+    textureStore(velocity_output, location, vec4<f32>(velocity.x, velocity.y, 0.0, 0.0));
 }
 
 
@@ -121,7 +129,7 @@ fn advect(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
 
     // Advection 
     let velocity = textureLoad(velocity_input, location).xy;
-    let advection_source = vec2<f32>(f32(location.x), f32(location.y)) - velocity.xy;
+    let advection_source = vec2<f32>(f32(location.x), f32(location.y)) - time_step * velocity.xy;
 
 
     let advected_color = bilinear_sample_x(input, advection_source);
