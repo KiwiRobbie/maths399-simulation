@@ -10,15 +10,17 @@ use bevy::{
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::{binding_types::texture_storage_2d, *},
-        renderer::{RenderContext, RenderDevice},
+        renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
 };
+use binding_types::uniform_buffer;
 use std::borrow::Cow;
 
 /// This example uses a shader source file from the assets subdirectory
-const SHADER_ASSET_PATH: &str = "shaders/game_of_life.wgsl";
+const ADVECTION_SHADER_ASSET_PATH: &str = "shaders/advection.wgsl";
+const JACOBI_SHADER_ASSET_PATH: &str = "shaders/jacobi.wgsl";
 
 const DISPLAY_FACTOR: u32 = 4;
 const SIZE: (u32, u32) = (1280 / DISPLAY_FACTOR, 720 / DISPLAY_FACTOR);
@@ -67,6 +69,23 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image0 = images.add(image.clone());
     let image1 = images.add(image);
 
+    let mut velocity_image = Image::new_fill(
+        Extent3d {
+            width: SIZE.0,
+            height: SIZE.1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rg32Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    velocity_image.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+
+    let velocity0 = images.add(velocity_image.clone());
+    let velocity1 = images.add(velocity_image);
+
     commands.spawn(SpriteBundle {
         sprite: Sprite {
             custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
@@ -81,6 +100,15 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(GameOfLifeImages {
         texture_a: image0,
         texture_b: image1,
+    });
+    commands.insert_resource(FluidSimulationParameters {
+        time_step: 1.0,
+        grid_step: 1.0,
+        viscosity: 1.0,
+    });
+    commands.insert_resource(FluidSimulationImages {
+        velocity_a: velocity0,
+        velocity_b: velocity1,
     });
 }
 
@@ -104,11 +132,14 @@ impl Plugin for GameOfLifeComputePlugin {
         // Extract the game of life image resource from the main world into the render world
         // for operation on by the compute shader and display on the sprite.
         app.add_plugins(ExtractResourcePlugin::<GameOfLifeImages>::default());
+        app.add_plugins(ExtractResourcePlugin::<FluidSimulationImages>::default());
+        app.add_plugins(ExtractResourcePlugin::<FluidSimulationParameters>::default());
         let render_app = app.sub_app_mut(RenderApp);
         render_app.add_systems(
             Render,
             prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
         );
+        render_app.add_systems(Render, prepare_uniforms.in_set(RenderSet::Prepare));
 
         let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
         render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
@@ -117,7 +148,8 @@ impl Plugin for GameOfLifeComputePlugin {
 
     fn finish(&self, app: &mut App) {
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<GameOfLifePipeline>();
+        render_app.init_resource::<FluidSimulationPipeline>();
+        render_app.init_resource::<FluidSimulationUniforms>();
     }
 }
 
@@ -127,74 +159,329 @@ struct GameOfLifeImages {
     texture_b: Handle<Image>,
 }
 
+#[derive(Resource, Clone, ExtractResource)]
+struct FluidSimulationParameters {
+    time_step: f32,
+    grid_step: f32,
+    viscosity: f32,
+}
+
+struct PoissonPressureBindGroups([BindGroup; 2]);
+struct PoissonDiffusionBindGroups([BindGroup; 2]);
+
+#[derive(Component, ShaderType, Clone, Default)]
+pub struct JacobiUniform {
+    pub alpha: f32,
+    pub r_beta: f32,
+}
+
 #[derive(Resource)]
-struct GameOfLifeImageBindGroups([BindGroup; 2]);
+struct FluidSimulationUniforms {
+    advection: UniformBuffer<AdvectionUniform>,
+    pressure: UniformBuffer<JacobiUniform>,
+    diffusion: UniformBuffer<JacobiUniform>,
+}
+
+impl FromWorld for FluidSimulationUniforms {
+    fn from_world(world: &mut World) -> Self {
+        let mut advection = UniformBuffer::default();
+        advection.set_label(Some("advection_uniforms_buffer"));
+
+        let mut pressure = UniformBuffer::default();
+        advection.set_label(Some("pressure_uniforms_buffer"));
+
+        let mut diffusion = UniformBuffer::default();
+        advection.set_label(Some("diffusion_uniforms_buffer"));
+
+        advection.add_usages(BufferUsages::UNIFORM);
+        pressure.add_usages(BufferUsages::UNIFORM);
+        diffusion.add_usages(BufferUsages::UNIFORM);
+
+        Self {
+            advection,
+            pressure,
+            diffusion,
+        }
+    }
+}
+
+#[derive(Resource, Clone, ExtractResource)]
+struct FluidSimulationImages {
+    velocity_a: Handle<Image>,
+    velocity_b: Handle<Image>,
+}
+
+#[derive(Component, ShaderType, Clone, Default)]
+pub struct AdvectionUniform {
+    pub time_step: f32,
+}
+
+#[derive(Resource)]
+struct SimulationDataBindGroups(BindGroup);
+
+#[derive(Resource)]
+struct FluidSimulationBindGroups {
+    advection_uniform: BindGroup,
+    advection_image: [BindGroup; 2],
+
+    pressure_uniform: BindGroup,
+    pressure_image: [BindGroup; 2],
+
+    diffusion_uniform: BindGroup,
+    diffusion_image: [BindGroup; 2],
+}
+
+fn prepare_uniforms(
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    mut fluid_simulation_uniforms: ResMut<FluidSimulationUniforms>,
+    parameters: Res<FluidSimulationParameters>,
+) {
+    let dx = parameters.grid_step;
+    let dt = parameters.time_step;
+    let pressure_alpha = -dx * dx;
+    let diffuse_alpha = dx * dx / (dt * parameters.viscosity);
+    let diffuse_beta = 4.0 + diffuse_alpha;
+    fluid_simulation_uniforms.pressure.set(JacobiUniform {
+        alpha: pressure_alpha,
+        r_beta: 0.25,
+    });
+    fluid_simulation_uniforms.diffusion.set(JacobiUniform {
+        alpha: diffuse_alpha,
+        r_beta: 1.0 / diffuse_beta,
+    });
+
+    fluid_simulation_uniforms
+        .advection
+        .write_buffer(&render_device, &render_queue);
+    fluid_simulation_uniforms
+        .pressure
+        .write_buffer(&render_device, &render_queue);
+    fluid_simulation_uniforms
+        .diffusion
+        .write_buffer(&render_device, &render_queue);
+}
 
 fn prepare_bind_group(
     mut commands: Commands,
-    pipeline: Res<GameOfLifePipeline>,
+    pipeline: Res<FluidSimulationPipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
+    uniforms: Res<FluidSimulationUniforms>,
     game_of_life_images: Res<GameOfLifeImages>,
+    fluid_simulation_images: Res<FluidSimulationImages>,
     render_device: Res<RenderDevice>,
 ) {
-    let view_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
-    let view_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
-    let bind_group_0 = render_device.create_bind_group(
+    // Uniform Bing Groups
+    let advection_uniform_bind_group = render_device.create_bind_group(
         None,
-        &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((&view_a.texture_view, &view_b.texture_view)),
+        &pipeline.advection_uniform_bind_group_layout,
+        &BindGroupEntries::single(uniforms.advection.into_binding()),
     );
-    let bind_group_1 = render_device.create_bind_group(
+    let pressure_uniform_bind_group = render_device.create_bind_group(
         None,
-        &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((&view_b.texture_view, &view_a.texture_view)),
+        &pipeline.jacobi_uniform_bind_group_layout,
+        &BindGroupEntries::single(uniforms.pressure.into_binding()),
     );
-    commands.insert_resource(GameOfLifeImageBindGroups([bind_group_0, bind_group_1]));
+
+    let diffusion_uniform_bind_group = render_device.create_bind_group(
+        None,
+        &pipeline.jacobi_uniform_bind_group_layout,
+        &BindGroupEntries::single(uniforms.diffusion.into_binding()),
+    );
+
+    // Advection
+    let view_buffer_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
+    let view_buffer_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
+    let velocity_buffer_a = gpu_images.get(&fluid_simulation_images.velocity_a).unwrap();
+    let velocity_buffer_b = gpu_images.get(&fluid_simulation_images.velocity_b).unwrap();
+    let advection_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.advection_image_group_layout,
+            &BindGroupEntries::sequential((
+                &view_buffer_a.texture_view,
+                &view_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_b.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.advection_image_group_layout,
+            &BindGroupEntries::sequential((
+                &view_buffer_b.texture_view,
+                &view_buffer_a.texture_view,
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
+            )),
+        ),
+    ];
+
+    // Pressure
+    let pressure_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_b.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
+            )),
+        ),
+    ];
+
+    // Diffusion
+    let diffusion_image_bind_groups = [
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_a.texture_view,
+                &velocity_buffer_b.texture_view,
+            )),
+        ),
+        render_device.create_bind_group(
+            None,
+            &pipeline.jacobi_image_bind_group_layout,
+            &BindGroupEntries::sequential((
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_b.texture_view,
+                &velocity_buffer_a.texture_view,
+            )),
+        ),
+    ];
+    commands.insert_resource(FluidSimulationBindGroups {
+        advection_uniform: advection_uniform_bind_group,
+        advection_image: advection_image_bind_groups,
+        pressure_uniform: pressure_uniform_bind_group,
+        pressure_image: pressure_image_bind_groups,
+        diffusion_uniform: diffusion_uniform_bind_group,
+        diffusion_image: diffusion_image_bind_groups,
+    })
 }
 
 #[derive(Resource)]
-struct GameOfLifePipeline {
-    texture_bind_group_layout: BindGroupLayout,
+struct FluidSimulationPipeline {
+    advection_uniform_bind_group_layout: BindGroupLayout,
+    advection_image_group_layout: BindGroupLayout,
+    jacobi_uniform_bind_group_layout: BindGroupLayout,
+    jacobi_image_bind_group_layout: BindGroupLayout,
     init_pipeline: CachedComputePipelineId,
-    update_pipeline: CachedComputePipelineId,
+    advection_pipeline: CachedComputePipelineId,
+    pressure_pipeline: CachedComputePipelineId,
+    diffusion_pipeline: CachedComputePipelineId,
 }
 
-impl FromWorld for GameOfLifePipeline {
+impl FromWorld for FluidSimulationPipeline {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
-        let texture_bind_group_layout = render_device.create_bind_group_layout(
-            "GameOfLifeImages",
+
+        let advection_uniform_bind_group_layout = render_device.create_bind_group_layout(
+            "AdvectionUniformLayout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (uniform_buffer::<AdvectionUniform>(false),),
+            ),
+        );
+        let jacobi_uniform_bind_group_layout = render_device.create_bind_group_layout(
+            "JacobiUniformLayout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (uniform_buffer::<JacobiUniform>(false),),
+            ),
+        );
+
+        let advection_image_group_layout = render_device.create_bind_group_layout(
+            "AdvectionImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
                     texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
                     texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
+                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly),
                 ),
             ),
         );
-        let shader = world.load_asset(SHADER_ASSET_PATH);
+        let jacobi_image_bind_group_layout = render_device.create_bind_group_layout(
+            "JacobiImageLayout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly),
+                    texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly),
+                ),
+            ),
+        );
+
+        let advection_shader = world.load_asset(ADVECTION_SHADER_ASSET_PATH);
+        let jacobi_shader = world.load_asset(JACOBI_SHADER_ASSET_PATH);
+
         let pipeline_cache = world.resource::<PipelineCache>();
         let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
-            layout: vec![texture_bind_group_layout.clone()],
+            layout: vec![
+                advection_uniform_bind_group_layout.clone(),
+                advection_image_group_layout.clone(),
+            ],
             push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
+            shader: advection_shader.clone(),
             shader_defs: vec![],
             entry_point: Cow::from("init"),
         });
-        let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        let advection_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
-            layout: vec![texture_bind_group_layout.clone()],
+            layout: vec![
+                advection_uniform_bind_group_layout.clone(),
+                advection_image_group_layout.clone(),
+            ],
             push_constant_ranges: Vec::new(),
-            shader,
+            shader: advection_shader,
             shader_defs: vec![],
-            entry_point: Cow::from("update"),
+            entry_point: Cow::from("advect"),
         });
-
-        GameOfLifePipeline {
-            texture_bind_group_layout,
+        let pressure_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: None,
+            layout: vec![
+                jacobi_uniform_bind_group_layout.clone(),
+                jacobi_image_bind_group_layout.clone(),
+            ],
+            push_constant_ranges: Vec::new(),
+            shader: jacobi_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Cow::from("jacobi"),
+        });
+        let diffusion_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: None,
+            layout: vec![
+                jacobi_uniform_bind_group_layout.clone(),
+                jacobi_image_bind_group_layout.clone(),
+            ],
+            push_constant_ranges: Vec::new(),
+            shader: jacobi_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Cow::from("jacobi"),
+        });
+        FluidSimulationPipeline {
+            advection_uniform_bind_group_layout,
+            advection_image_group_layout,
+            jacobi_image_bind_group_layout,
+            jacobi_uniform_bind_group_layout,
             init_pipeline,
-            update_pipeline,
+            advection_pipeline,
+            diffusion_pipeline,
+            pressure_pipeline,
         }
     }
 }
@@ -219,7 +506,7 @@ impl Default for GameOfLifeNode {
 
 impl render_graph::Node for GameOfLifeNode {
     fn update(&mut self, world: &mut World) {
-        let pipeline = world.resource::<GameOfLifePipeline>();
+        let pipeline = world.resource::<FluidSimulationPipeline>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
         // if the corresponding pipeline has loaded, transition to the next stage
@@ -230,14 +517,14 @@ impl render_graph::Node for GameOfLifeNode {
                         self.state = GameOfLifeState::Init;
                     }
                     CachedPipelineState::Err(err) => {
-                        panic!("Initializing assets/{SHADER_ASSET_PATH}:\n{err}")
+                        panic!("Initializing assets/{ADVECTION_SHADER_ASSET_PATH}:\n{err}")
                     }
                     _ => {}
                 }
             }
             GameOfLifeState::Init => {
                 if let CachedPipelineState::Ok(_) =
-                    pipeline_cache.get_compute_pipeline_state(pipeline.update_pipeline)
+                    pipeline_cache.get_compute_pipeline_state(pipeline.advection_pipeline)
                 {
                     self.state = GameOfLifeState::Update(1);
                 }
@@ -258,9 +545,10 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let bind_groups = &world.resource::<GameOfLifeImageBindGroups>().0;
+        let data_bind_group = &world.resource::<SimulationDataBindGroups>().0;
+        let image_bind_groups = &world.resource::<SimulationImageBindGroups>().0;
         let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<GameOfLifePipeline>();
+        let pipeline = world.resource::<FluidSimulationPipeline>();
 
         let mut pass = render_context
             .command_encoder()
@@ -273,16 +561,22 @@ impl render_graph::Node for GameOfLifeNode {
                 let init_pipeline = pipeline_cache
                     .get_compute_pipeline(pipeline.init_pipeline)
                     .unwrap();
-                pass.set_bind_group(0, &bind_groups[0], &[]);
+                pass.set_bind_group(0, &data_bind_group, &[]);
+                pass.set_bind_group(1, &image_bind_groups[0], &[]);
                 pass.set_pipeline(init_pipeline);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
             GameOfLifeState::Update(index) => {
                 let update_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.update_pipeline)
+                    .get_compute_pipeline(pipeline.advection_pipeline)
                     .unwrap();
-                pass.set_bind_group(0, &bind_groups[index], &[]);
                 pass.set_pipeline(update_pipeline);
+
+                pass.set_bind_group(0, &data_bind_group, &[]);
+                pass.set_bind_group(1, &image_bind_groups[1], &[]);
+                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                pass.set_bind_group(1, &image_bind_groups[0], &[]);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
         }
