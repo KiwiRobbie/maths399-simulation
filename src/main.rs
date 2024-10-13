@@ -1,26 +1,20 @@
-//! A compute shader that simulates Conway's Game of Life.
-//!
-//! Compute shaders use the GPU for computing arbitrary information, that may be independent of what
-//! is rendered to the screen.
-
 use bevy::{
-    core_pipeline::fullscreen_vertex_shader::{
-        self, fullscreen_shader_vertex_state, FULLSCREEN_SHADER_HANDLE,
-    },
-    input::keyboard::{Key, KeyboardInput},
+    diagnostic::DiagnosticsStore,
+    input::keyboard::KeyboardInput,
     prelude::*,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
-        render_resource::{binding_types::texture_storage_2d, *},
+        render_resource::*,
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
     sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle, Mesh2dHandle},
 };
-use binding_types::uniform_buffer;
+use bevy_egui::{egui, EguiContexts, EguiPlugin};
+use binding_types::{texture_storage_2d, uniform_buffer};
 use std::borrow::Cow;
 
 /// This example uses a shader source file from the assets subdirectory
@@ -52,11 +46,14 @@ fn main() {
                     ..default()
                 })
                 .set(ImagePlugin::default_nearest()),
-            GameOfLifeComputePlugin,
+            FluidSimulationComputePlugin,
+            EguiPlugin,
             Material2dPlugin::<CustomMaterial>::default(),
+            bevy::diagnostic::FrameTimeDiagnosticsPlugin,
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, keyboard)
+        .add_systems(Update, ui_system.after(keyboard))
         .init_resource::<ResetSimulation>()
         .run();
 }
@@ -71,6 +68,59 @@ fn keyboard(mut ev_keyboard: EventReader<KeyboardInput>, mut res_reset: ResMut<R
             *res_reset.as_deref_mut() = true;
         }
     }
+}
+
+fn ui_system(
+    mut contexts: EguiContexts,
+    mut res_reset: ResMut<ResetSimulation>,
+    mut parameters: ResMut<FluidSimulationParameters>,
+    diagnostics: Res<DiagnosticsStore>,
+) {
+    egui::Window::new("Simulation Options").show(contexts.ctx_mut(), |ui| {
+        ui.heading("Performance");
+        egui::Grid::new("performance_grid").show(ui, |ui| {
+            for diagnostic in diagnostics.iter() {
+                let (Some(value), Some(avg)) = (diagnostic.smoothed(), diagnostic.average()) else {
+                    continue;
+                };
+                ui.label(diagnostic.path().as_str());
+                ui.label(format!("{:4.3} {}", value, diagnostic.suffix));
+                ui.label(format!("{:4.3} {}", avg, diagnostic.suffix));
+                ui.end_row();
+            }
+        });
+
+        ui.spacing();
+
+        ui.heading("Controls");
+        if ui.button("Reset Simulation").clicked() {
+            *res_reset.as_deref_mut() = true;
+        }
+        ui.spacing();
+
+        ui.heading("Parameters");
+        egui::Grid::new("grid").show(ui, |ui| {
+            ui.label("Viscosity");
+            ui.add(egui::Slider::new(&mut parameters.viscosity, 0.0..=10.0).logarithmic(true));
+            ui.end_row();
+
+            ui.label("Grid Step");
+            ui.add(egui::Slider::new(&mut parameters.grid_step, 0.0..=1.0).logarithmic(true));
+            ui.end_row();
+
+            ui.label("Time Step");
+            ui.add(egui::Slider::new(&mut parameters.time_step, 0.0..=1.0).logarithmic(true));
+            ui.end_row();
+
+            ui.label("Diffusion Iterations");
+            ui.add(egui::DragValue::new(&mut parameters.diffusion_iterations).range(0..=100));
+            ui.end_row();
+
+            ui.label("Pressure Iterations");
+            ui.add(egui::DragValue::new(&mut parameters.pressure_iterations).range(0..=100));
+            ui.end_row();
+        });
+    });
 }
 
 fn setup(
@@ -137,6 +187,8 @@ fn setup(
         time_step: 0.025,
         grid_step: 0.02,
         viscosity: 0.001,
+        diffusion_iterations: 20,
+        pressure_iterations: 50,
     });
     commands.insert_resource(FluidSimulationImages {
         velocity_a: velocity0,
@@ -147,12 +199,12 @@ fn setup(
     });
 }
 
-struct GameOfLifeComputePlugin;
+struct FluidSimulationComputePlugin;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct GameOfLifeLabel;
 
-impl Plugin for GameOfLifeComputePlugin {
+impl Plugin for FluidSimulationComputePlugin {
     fn build(&self, app: &mut App) {
         // Extract the game of life image resource from the main world into the render world
         // for operation on by the compute shader and display on the sprite.
@@ -193,6 +245,8 @@ struct FluidSimulationParameters {
     time_step: f32,
     grid_step: f32,
     viscosity: f32,
+    diffusion_iterations: usize,
+    pressure_iterations: usize,
 }
 
 #[derive(Component, ShaderType, Clone, Default)]
@@ -679,7 +733,8 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let bind_groups = &world.resource::<FluidSimulationBindGroups>();
+        let parameters = world.resource::<FluidSimulationParameters>();
+        let bind_groups = world.resource::<FluidSimulationBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<FluidSimulationPipeline>();
 
@@ -695,13 +750,33 @@ impl render_graph::Node for GameOfLifeNode {
                 else {
                     return Ok(());
                 };
+                drop(pass);
+                let gpu_images = world.resource::<RenderAssets<GpuImage>>();
+                let fluid_simulation_images = world.resource::<FluidSimulationImages>();
+                let game_of_life_images = world.resource::<GameOfLifeImages>();
 
+                let textures = [
+                    gpu_images.get(&game_of_life_images.texture_a).unwrap(),
+                    gpu_images.get(&game_of_life_images.texture_b).unwrap(),
+                    gpu_images.get(&fluid_simulation_images.velocity_a).unwrap(),
+                    gpu_images.get(&fluid_simulation_images.velocity_b).unwrap(),
+                    gpu_images.get(&fluid_simulation_images.divergence).unwrap(),
+                    gpu_images.get(&fluid_simulation_images.pressure_a).unwrap(),
+                    gpu_images.get(&fluid_simulation_images.pressure_b).unwrap(),
+                ];
+
+                for image in textures.into_iter() {
+                    encoder.clear_texture(&image.texture, &Default::default());
+                }
+
+                let mut pass: ComputePass<'_> =
+                    encoder.begin_compute_pass(&ComputePassDescriptor::default());
                 pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
                 pass.set_bind_group(1, &bind_groups.advection_image[0], &[]);
                 pass.set_pipeline(init_pipeline);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
-            GameOfLifeState::Update(index) => {
+            GameOfLifeState::Update(_) => {
                 let index = 1;
                 // Advection
                 let Some(advection_pipeline) =
@@ -727,7 +802,7 @@ impl render_graph::Node for GameOfLifeNode {
                 pass.set_bind_group(0, &bind_groups.diffusion_uniform, &[]);
 
                 // Iterate diffusion, result in off-prime buffer
-                for _ in 0..50 {
+                for _ in 0..parameters.diffusion_iterations {
                     // off-prime -> prime
                     pass.set_bind_group(1, &bind_groups.diffusion_image[index], &[]);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
@@ -758,7 +833,7 @@ impl render_graph::Node for GameOfLifeNode {
 
                 pass.set_pipeline(pressure_pipeline);
                 pass.set_bind_group(0, &bind_groups.pressure_uniform, &[]);
-                for j in 0usize..100usize {
+                for j in 0usize..parameters.pressure_iterations {
                     pass.set_bind_group(1, &bind_groups.pressure_image[j.rem_euclid(2)], &[]);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
                 }
