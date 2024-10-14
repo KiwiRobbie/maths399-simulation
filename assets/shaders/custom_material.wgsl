@@ -1,4 +1,4 @@
-#import bevy_pbr::forward_io::VertexOutput
+#import bevy_sprite::mesh2d_vertex_output::VertexOutput
 
 
 struct CustomMaterial {
@@ -21,10 +21,10 @@ struct CustomMaterial {
 fn fragment(
     in: VertexOutput,
 ) -> @location(0) vec4<f32> {
-    let uv = vec2<f32>(
-        in.position.x / f32(textureDimensions(velocity_texture).x),
-        in.position.y / f32(textureDimensions(velocity_texture).y),
-    );
+    let uv = in.uv; // vec2<f32>(
+    //    in.position.x / f32(textureDimensions(velocity_texture).x),
+    //    in.position.y / f32(textureDimensions(velocity_texture).y),
+    // );
     let velocity = textureSample(velocity_texture, velocity_sampler, uv).xy ;
     let color = textureSample(color_texture, color_sampler, uv).r;
     let pressure = textureSample(pressure_texture, pressure_sampler, uv).r;
