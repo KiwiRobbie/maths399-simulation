@@ -8,9 +8,9 @@ struct GeneralUniform {
 
 @group(1) @binding(0) var input: texture_storage_2d<r32float, read>;
 @group(1) @binding(1) var output: texture_storage_2d<r32float, write>;
-@group(1) @binding(2) var velocity_input: texture_storage_2d<rg32float, read>;
-@group(1) @binding(3) var velocity_output: texture_storage_2d<rg32float, write>;
-@group(1) @binding(4) var velocity_copy: texture_storage_2d<rg32float, write>;
+@group(1) @binding(2) var velocity_input: texture_storage_2d<rgba32float, read>;
+@group(1) @binding(3) var velocity_output: texture_storage_2d<rgba32float, write>;
+@group(1) @binding(4) var velocity_copy: texture_storage_2d<rgba32float, write>;
 
 
 fn hash(value: u32) -> u32 {
@@ -102,7 +102,7 @@ fn bilinear_sample_x(texture: texture_storage_2d<r32float, read>, pixelPos: vec2
     return mix(top, bottom, frac.y).x;
 }
 
-fn bilinear_sample_xy(texture: texture_storage_2d<rg32float, read>, pixelPos: vec2<f32>) -> vec2<f32> {
+fn bilinear_sample_xy(texture: texture_storage_2d<rgba32float, read>, pixelPos: vec2<f32>) -> vec2<f32> {
     // Get the texture size using textureDimensions
     let textureSize: vec2<i32> = vec2<i32>(
         i32(textureDimensions(texture).x),

@@ -5,10 +5,10 @@ struct GeneralUniform {
 }
 
 @group(0) @binding(0) var<uniform> uniforms: GeneralUniform;
-@group(1) @binding(0) var w_input: texture_storage_2d<rg32float, read>;
+@group(1) @binding(0) var w_input: texture_storage_2d<rgba32float, read>;
 @group(1) @binding(1) var c_input: texture_storage_2d<r32float, read>;
-@group(1) @binding(2) var p_input: texture_storage_2d<rg32float, read>;
-@group(1) @binding(3) var u_output: texture_storage_2d<rg32float, write>;
+@group(1) @binding(2) var p_input: texture_storage_2d<rgba32float, read>;
+@group(1) @binding(3) var u_output: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(4) var c_output: texture_storage_2d<r32float, write>;
 
 @compute @workgroup_size(8, 8, 1)

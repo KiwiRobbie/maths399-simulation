@@ -153,7 +153,7 @@ fn setup(
         },
         TextureDimension::D2,
         &[0, 0, 0, 0],
-        TextureFormat::Rg32Float,
+        TextureFormat::Rgba32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
     vector_image.texture_descriptor.usage =
@@ -555,9 +555,10 @@ impl FromWorld for FluidSimulationPipeline {
         let r_read = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly);
         let r_write = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly);
 
-        let rg_read = texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::ReadOnly);
+        let rg_read =
+            texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadOnly);
         let rg_write =
-            texture_storage_2d(TextureFormat::Rg32Float, StorageTextureAccess::WriteOnly);
+            texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly);
 
         let advection_image_group_layout = render_device.create_bind_group_layout(
             "AdvectionImageLayout",

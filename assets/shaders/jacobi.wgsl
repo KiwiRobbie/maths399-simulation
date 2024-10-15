@@ -11,9 +11,9 @@ struct UniformData {
 
 @group(0) @binding(0) var<uniform> uniforms: UniformData;
 
-@group(1) @binding(0) var input_x: texture_storage_2d<rg32float, read>;
-@group(1) @binding(1) var input_b: texture_storage_2d<rg32float, read>;
-@group(1) @binding(2) var output_x: texture_storage_2d<rg32float, write>;
+@group(1) @binding(0) var input_x: texture_storage_2d<rgba32float, read>;
+@group(1) @binding(1) var input_b: texture_storage_2d<rgba32float, read>;
+@group(1) @binding(2) var output_x: texture_storage_2d<rgba32float, write>;
 
 
 @compute @workgroup_size(8, 8, 1)
