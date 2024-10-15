@@ -10,6 +10,7 @@ struct GeneralUniform {
 @group(1) @binding(1) var output: texture_storage_2d<r32float, write>;
 @group(1) @binding(2) var velocity_input: texture_storage_2d<rg32float, read>;
 @group(1) @binding(3) var velocity_output: texture_storage_2d<rg32float, write>;
+@group(1) @binding(4) var velocity_copy: texture_storage_2d<rg32float, write>;
 
 
 fn hash(value: u32) -> u32 {
@@ -151,5 +152,6 @@ fn advect(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     let advected_velocity = bilinear_sample_xy(velocity_input, advection_source).xy;
     textureStore(output, location, vec4<f32>(advected_color));
     textureStore(velocity_output, location, vec4<f32>(advected_velocity.x, advected_velocity.y, 0.0, 0.0));
+    textureStore(velocity_copy, location, vec4<f32>(advected_velocity.x, advected_velocity.y, 0.0, 0.0));
 }
 

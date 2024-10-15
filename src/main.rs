@@ -399,6 +399,7 @@ fn prepare_bind_group(
                 &color_buffer_b.texture_view,
                 &velocity_buffer_a.texture_view,
                 &velocity_buffer_b.texture_view,
+                &divergence_buffer.texture_view,
             )),
         ),
         render_device.create_bind_group(
@@ -409,6 +410,7 @@ fn prepare_bind_group(
                 &color_buffer_a.texture_view,
                 &velocity_buffer_b.texture_view,
                 &velocity_buffer_a.texture_view,
+                &divergence_buffer.texture_view,
             )),
         ),
     ];
@@ -420,7 +422,7 @@ fn prepare_bind_group(
             &pipeline.jacobi_image_bind_group_layout,
             &BindGroupEntries::sequential((
                 &velocity_buffer_b.texture_view,
-                &velocity_buffer_b.texture_view,
+                &divergence_buffer.texture_view,
                 &velocity_buffer_a.texture_view,
             )),
         ),
@@ -429,7 +431,7 @@ fn prepare_bind_group(
             &pipeline.jacobi_image_bind_group_layout,
             &BindGroupEntries::sequential((
                 &velocity_buffer_a.texture_view,
-                &velocity_buffer_a.texture_view,
+                &divergence_buffer.texture_view,
                 &velocity_buffer_b.texture_view,
             )),
         ),
@@ -561,7 +563,7 @@ impl FromWorld for FluidSimulationPipeline {
             "AdvectionImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (r_read, r_write, rg_read, rg_write),
+                (r_read, r_write, rg_read, rg_write, rg_write),
             ),
         );
         let jacobi_image_bind_group_layout = render_device.create_bind_group_layout(
@@ -739,8 +741,7 @@ impl render_graph::Node for GameOfLifeNode {
         let pipeline = world.resource::<FluidSimulationPipeline>();
 
         let encoder = render_context.command_encoder();
-        let mut pass: ComputePass<'_> =
-            encoder.begin_compute_pass(&ComputePassDescriptor::default());
+
         // select the pipeline based on the current state
         match self.state {
             GameOfLifeState::Loading => {}
@@ -750,7 +751,6 @@ impl render_graph::Node for GameOfLifeNode {
                 else {
                     return Ok(());
                 };
-                drop(pass);
                 let gpu_images = world.resource::<RenderAssets<GpuImage>>();
                 let fluid_simulation_images = world.resource::<FluidSimulationImages>();
                 let game_of_life_images = world.resource::<GameOfLifeImages>();
@@ -784,7 +784,18 @@ impl render_graph::Node for GameOfLifeNode {
                 else {
                     return Ok(());
                 };
+                // let gpu_images = world.resource::<RenderAssets<GpuImage>>();
+                // let fluid_simulation_images = world.resource::<FluidSimulationImages>();
 
+                // for image in [
+                //     gpu_images.get(&fluid_simulation_images.pressure_a).unwrap(),
+                //     gpu_images.get(&fluid_simulation_images.pressure_b).unwrap(),
+                // ] {
+                //     encoder.clear_texture(&image.texture, &Default::default());
+                // }
+
+                let mut pass: ComputePass<'_> =
+                    encoder.begin_compute_pass(&ComputePassDescriptor::default());
                 pass.set_pipeline(advection_pipeline);
                 pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
 
