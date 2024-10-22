@@ -18,7 +18,7 @@ fn output(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
 
     let color = textureLoad(color_input, location).x;
     let velocity = textureLoad(velocity_input, location).xy;
-    let pressure = textureLoad(pressure_input, location).x;
+    let pressure = 0.2 * textureLoad(pressure_input, location).x;
 
     let out = vec4<f32>(color, color, color, 1.0) * vec4<f32>(max(0.0, pressure), 0.25, max(0.0, -pressure), 1.0);
     textureStore(texture_output, location, out);

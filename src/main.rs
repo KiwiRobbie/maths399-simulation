@@ -203,7 +203,7 @@ fn setup(
         texture_b: image1,
     });
     commands.insert_resource(FluidSimulationParameters {
-        time_step: 0.025,
+        time_step: 0.0125,
         grid_step: 0.02,
         viscosity: 0.001,
         diffusion_iterations: 20,
@@ -269,7 +269,7 @@ fn readback_observer(
             image_data.extend(
                 pixel
                     .into_iter()
-                    .map(|p| (255.0 * p.clamp(0.0, 1.0)) as u8)
+                    .map(|p| (255.0 * p.clamp(0.0, 1.0).powf(1.0 / 2.2)) as u8)
                     .take(3),
             );
         } else {
@@ -285,7 +285,7 @@ fn readback_observer(
     }
     let img = RgbImage::from_vec(1024, 1024, image_data).unwrap();
 
-    img.save(format!("out/{}-{}.png", name, *count));
+    img.save(format!("out/{}-{:05}.png", name, *count));
     *count += 1;
 }
 

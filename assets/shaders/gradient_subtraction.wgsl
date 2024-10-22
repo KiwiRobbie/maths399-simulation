@@ -23,7 +23,7 @@ fn gradient_subtraction(@builtin(global_invocation_id) invocation_id: vec3<u32>)
 
     let velocity = textureLoad(w_input, location).xy - uniforms.half_rdx * vec2<f32>(p_right - p_left, p_up - p_down);
 
-    let color = max(textureLoad(c_input, location) * exp(-uniforms.time_step), vec4<f32>(f32(location.x % 32 == 0 && location.y % 32 == 0)));
+    let color = max(textureLoad(c_input, location) * exp(-0.75 * uniforms.time_step), vec4<f32>(f32(location.x % 32 == 0 && location.y % 32 == 0)));
     let velocity_allow_x = f32(location.x != 0) * f32(location.x < 1023);
     let velocity_allow_y = f32(location.y != 0) * f32(location.y < 1023);
     let velocity_allow = velocity_allow_x * velocity_allow_y;
