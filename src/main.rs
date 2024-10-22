@@ -1,9 +1,9 @@
 use bevy::{
-    diagnostic::DiagnosticsStore,
     input::keyboard::KeyboardInput,
     prelude::*,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
+        gpu_readback::{Readback, ReadbackComplete},
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::*,
@@ -11,9 +11,13 @@ use bevy::{
         texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
-    sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle, Mesh2dHandle},
+    sprite::{Material2d, Material2dPlugin},
 };
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
+
+use image::RgbImage;
+use std::ops::Rem;
+
+// use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use binding_types::{texture_storage_2d, uniform_buffer};
 use std::borrow::Cow;
 
@@ -30,7 +34,7 @@ const WORKGROUP_SIZE: u32 = 8;
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::BLACK))
-        .add_plugins((
+        .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
@@ -46,14 +50,18 @@ fn main() {
                     ..default()
                 })
                 .set(ImagePlugin::default_nearest()),
+        )
+        .add_plugins((
             FluidSimulationComputePlugin,
-            EguiPlugin,
+            // GpuReadbackPlugin::default(),
+            // ExtractResourcePlugin::<ReadbackBuffer>::default(),
+            // EguiPlugin,
             Material2dPlugin::<CustomMaterial>::default(),
             bevy::diagnostic::FrameTimeDiagnosticsPlugin,
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, keyboard)
-        .add_systems(Update, ui_system.after(keyboard))
+        // .add_systems(Update, ui_system.after(keyboard))
         .init_resource::<ResetSimulation>()
         .run();
 }
@@ -70,58 +78,60 @@ fn keyboard(mut ev_keyboard: EventReader<KeyboardInput>, mut res_reset: ResMut<R
     }
 }
 
-fn ui_system(
-    mut contexts: EguiContexts,
-    mut res_reset: ResMut<ResetSimulation>,
-    mut parameters: ResMut<FluidSimulationParameters>,
-    diagnostics: Res<DiagnosticsStore>,
-) {
-    egui::Window::new("Simulation Options").show(contexts.ctx_mut(), |ui| {
-        ui.heading("Performance");
-        egui::Grid::new("performance_grid").show(ui, |ui| {
-            for diagnostic in diagnostics.iter() {
-                let (Some(value), Some(avg)) = (diagnostic.smoothed(), diagnostic.average()) else {
-                    continue;
-                };
-                ui.label(diagnostic.path().as_str());
-                ui.label(format!("{:4.3} {}", value, diagnostic.suffix));
-                ui.label(format!("{:4.3} {}", avg, diagnostic.suffix));
-                ui.end_row();
-            }
-        });
+// fn ui_system(
+//     mut contexts: EguiContexts,
+//     mut res_reset: ResMut<ResetSimulation>,
+//     mut parameters: ResMut<FluidSimulationParameters>,
+//     diagnostics: Res<DiagnosticsStore>,
+// ) {
+//     egui::Window::new("Simulation Options").show(contexts.ctx_mut(), |ui| {
+//         ui.heading("Performance");
+//         egui::Grid::new("performance_grid").show(ui, |ui| {
+//             for diagnostic in diagnostics.iter() {
+//                 let (Some(value), Some(avg)) = (diagnostic.smoothed(), diagnostic.average()) else {
+//                     continue;
+//                 };
+//                 ui.label(diagnostic.path().as_str());
+//                 ui.label(format!("{:4.3} {}", value, diagnostic.suffix));
+//                 ui.label(format!("{:4.3} {}", avg, diagnostic.suffix));
+//                 ui.end_row();
+//             }
+//         });
 
-        ui.spacing();
+//         ui.spacing();
 
-        ui.heading("Controls");
-        if ui.button("Reset Simulation").clicked() {
-            *res_reset.as_deref_mut() = true;
-        }
-        ui.spacing();
+//         ui.heading("Controls");
+//         if ui.button("Reset Simulation").clicked() {
+//             *res_reset.as_deref_mut() = true;
+//         }
+//         ui.spacing();
 
-        ui.heading("Parameters");
-        egui::Grid::new("grid").show(ui, |ui| {
-            ui.label("Viscosity");
-            ui.add(egui::Slider::new(&mut parameters.viscosity, 0.0..=10.0).logarithmic(true));
-            ui.end_row();
+//         ui.heading("Parameters");
+//         egui::Grid::new("grid").show(ui, |ui| {
+//             ui.label("Viscosity");
+//             ui.add(egui::Slider::new(&mut parameters.viscosity, 0.0..=10.0).logarithmic(true));
+//             ui.end_row();
 
-            ui.label("Grid Step");
-            ui.add(egui::Slider::new(&mut parameters.grid_step, 0.0..=1.0).logarithmic(true));
-            ui.end_row();
+//             ui.label("Grid Step");
+//             ui.add(egui::Slider::new(&mut parameters.grid_step, 0.0..=1.0).logarithmic(true));
+//             ui.end_row();
 
-            ui.label("Time Step");
-            ui.add(egui::Slider::new(&mut parameters.time_step, 0.0..=1.0).logarithmic(true));
-            ui.end_row();
+//             ui.label("Time Step");
+//             ui.add(egui::Slider::new(&mut parameters.time_step, 0.0..=1.0).logarithmic(true));
+//             ui.end_row();
 
-            ui.label("Diffusion Iterations");
-            ui.add(egui::DragValue::new(&mut parameters.diffusion_iterations).range(0..=100));
-            ui.end_row();
+//             ui.label("Diffusion Iterations");
+//             ui.add(egui::DragValue::new(&mut parameters.diffusion_iterations).range(0..=100));
+//             ui.end_row();
 
-            ui.label("Pressure Iterations");
-            ui.add(egui::DragValue::new(&mut parameters.pressure_iterations).range(0..=100));
-            ui.end_row();
-        });
-    });
-}
+//             ui.label("Pressure Iterations");
+//             ui.add(egui::DragValue::new(&mut parameters.pressure_iterations).range(0..=100));
+//             ui.end_row();
+//         });
+//     });
+// }
+#[derive(Component)]
+struct ReadbackTextureTag(String);
 
 fn setup(
     mut commands: Commands,
@@ -140,8 +150,10 @@ fn setup(
         TextureFormat::R32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    scalar_image.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    scalar_image.texture_descriptor.usage = TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::STORAGE_BINDING
+        | TextureUsages::TEXTURE_BINDING;
     let image0 = images.add(scalar_image.clone());
     let image1 = images.add(scalar_image.clone());
 
@@ -156,8 +168,10 @@ fn setup(
         TextureFormat::Rgba32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    vector_image.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    vector_image.texture_descriptor.usage = TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::STORAGE_BINDING
+        | TextureUsages::TEXTURE_BINDING;
 
     let velocity0 = images.add(vector_image.clone());
     let velocity1 = images.add(vector_image.clone());
@@ -165,19 +179,17 @@ fn setup(
     let pressure1 = images.add(vector_image.clone());
     let divergence = images.add(vector_image);
 
-    commands.spawn(MaterialMesh2dBundle {
-        // material: materials.add(Color::WHITE),
-        mesh: Mesh2dHandle(meshes.add(Rectangle::new(SIZE.0 as f32, SIZE.1 as f32))),
-        material: materials.add(CustomMaterial {
+    commands.spawn((
+        MeshMaterial2d(materials.add(CustomMaterial {
             color_texture: image0.clone(),
             velocity_texture: velocity0.clone(),
             pressure_texture: pressure0.clone(),
             divergence_texture: divergence.clone(),
-        }),
-        ..Default::default()
-    });
+        })),
+        Mesh2d(meshes.add(Rectangle::new(SIZE.0 as f32, SIZE.1 as f32))),
+    ));
 
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn(Camera2d::default());
 
     commands.insert_resource(GameOfLifeImages {
         texture_a: image0,
@@ -190,6 +202,25 @@ fn setup(
         diffusion_iterations: 20,
         pressure_iterations: 50,
     });
+    commands
+        .spawn((
+            ReadbackTextureTag("velocity".into()),
+            Readback::texture(velocity0.clone()),
+        ))
+        .observe(vector_observer);
+    commands
+        .spawn((
+            ReadbackTextureTag("pressure".into()),
+            Readback::texture(pressure0.clone()),
+        ))
+        .observe(vector_observer);
+    commands
+        .spawn((
+            ReadbackTextureTag("divergence".into()),
+            Readback::texture(divergence.clone()),
+        ))
+        .observe(vector_observer);
+
     commands.insert_resource(FluidSimulationImages {
         velocity_a: velocity0,
         velocity_b: velocity1,
@@ -197,6 +228,43 @@ fn setup(
         pressure_b: pressure1,
         divergence,
     });
+}
+
+fn vector_observer(
+    trigger: Trigger<ReadbackComplete>,
+    mut count: Local<u32>,
+    q_tag: Query<&ReadbackTextureTag>,
+) {
+    let name = &q_tag.get(trigger.entity()).unwrap().0;
+    let data: Vec<f32> = trigger.event().to_shader_type();
+    let mut image_data = Vec::<u8>::new();
+    let scale = match name.as_str() {
+        "pressure" => 10.0,
+        "velocity" => 1.0,
+        "divergence" => 0.5,
+        _ => 1.0,
+    };
+
+    for (i, pixel) in data.chunks(4).enumerate() {
+        if i.rem(1040) >= 1024 {
+            continue;
+        }
+        let x = scale * pixel[0];
+        let y = scale * pixel[1];
+
+        let u = (x + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
+        let v = (y + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
+
+        // let u = i.rem_euclid(256) as u8;
+        // let v = i.div_euclid(256).rem_euclid(256) as u8;
+        image_data.push(u);
+        image_data.push(v);
+        image_data.push(127);
+    }
+    let img = RgbImage::from_vec(1024, 1024, image_data).unwrap();
+
+    img.save(format!("out/{}-{}.png", name, *count));
+    *count += 1;
 }
 
 struct FluidSimulationComputePlugin;
