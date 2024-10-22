@@ -26,6 +26,7 @@ const ADVECTION_SHADER_ASSET_PATH: &str = "shaders/advection.wgsl";
 const JACOBI_SHADER_ASSET_PATH: &str = "shaders/jacobi.wgsl";
 const DIVERGENCE_SHADER_ASSET_PATH: &str = "shaders/divergence.wgsl";
 const GRADIENT_SUBTRACTION_SHADER_ASSET_PATH: &str = "shaders/gradient_subtraction.wgsl";
+const OUTPUT_SHADER_ASSET_PATH: &str = "shaders/output.wgsl";
 
 const DISPLAY_FACTOR: u32 = 1;
 const SIZE: (u32, u32) = (1024 / DISPLAY_FACTOR, 1024 / DISPLAY_FACTOR);
@@ -136,7 +137,7 @@ struct ReadbackTextureTag(String);
 fn setup(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<CustomMaterial>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let mut scalar_image = Image::new_fill(
@@ -173,19 +174,25 @@ fn setup(
         | TextureUsages::STORAGE_BINDING
         | TextureUsages::TEXTURE_BINDING;
 
-    let velocity0 = images.add(vector_image.clone());
-    let velocity1 = images.add(vector_image.clone());
-    let pressure0: Handle<Image> = images.add(vector_image.clone());
-    let pressure1 = images.add(vector_image.clone());
+    let output = images.add(vector_image.clone());
+    let velocity_a = images.add(vector_image.clone());
+    let velocity_b = images.add(vector_image.clone());
+    let pressure_a: Handle<Image> = images.add(vector_image.clone());
+    let pressure_b = images.add(vector_image.clone());
     let divergence = images.add(vector_image);
 
     commands.spawn((
-        MeshMaterial2d(materials.add(CustomMaterial {
-            color_texture: image0.clone(),
-            velocity_texture: velocity0.clone(),
-            pressure_texture: pressure0.clone(),
-            divergence_texture: divergence.clone(),
+        MeshMaterial2d(materials.add(ColorMaterial {
+            texture: Some(output.clone()),
+            color: Color::WHITE,
+            alpha_mode: bevy::sprite::AlphaMode2d::Opaque,
         })),
+        // MeshMaterial2d(materials.add(CustomMaterial {
+        //     color_texture: image0.clone(),
+        //     velocity_texture: velocity0.clone(),
+        //     pressure_texture: pressure0.clone(),
+        //     divergence_texture: divergence.clone(),
+        // })),
         Mesh2d(meshes.add(Rectangle::new(SIZE.0 as f32, SIZE.1 as f32))),
     ));
 
@@ -205,32 +212,38 @@ fn setup(
     commands
         .spawn((
             ReadbackTextureTag("velocity".into()),
-            Readback::texture(velocity0.clone()),
+            Readback::texture(velocity_a.clone()),
         ))
-        .observe(vector_observer);
+        .observe(readback_observer);
     commands
         .spawn((
             ReadbackTextureTag("pressure".into()),
-            Readback::texture(pressure0.clone()),
+            Readback::texture(pressure_a.clone()),
         ))
-        .observe(vector_observer);
+        .observe(readback_observer);
     commands
         .spawn((
             ReadbackTextureTag("divergence".into()),
             Readback::texture(divergence.clone()),
         ))
-        .observe(vector_observer);
-
+        .observe(readback_observer);
+    commands
+        .spawn((
+            ReadbackTextureTag("output".into()),
+            Readback::texture(output.clone()),
+        ))
+        .observe(readback_observer);
     commands.insert_resource(FluidSimulationImages {
-        velocity_a: velocity0,
-        velocity_b: velocity1,
-        pressure_a: pressure0,
-        pressure_b: pressure1,
+        output,
+        velocity_a,
+        velocity_b,
+        pressure_a,
+        pressure_b,
         divergence,
     });
 }
 
-fn vector_observer(
+fn readback_observer(
     trigger: Trigger<ReadbackComplete>,
     mut count: Local<u32>,
     q_tag: Query<&ReadbackTextureTag>,
@@ -245,21 +258,30 @@ fn vector_observer(
         _ => 1.0,
     };
 
+    let true_color = name.as_str() == "output";
+
     for (i, pixel) in data.chunks(4).enumerate() {
         if i.rem(1040) >= 1024 {
             continue;
         }
-        let x = scale * pixel[0];
-        let y = scale * pixel[1];
 
-        let u = (x + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
-        let v = (y + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
+        if true_color {
+            image_data.extend(
+                pixel
+                    .into_iter()
+                    .map(|p| (255.0 * p.clamp(0.0, 1.0)) as u8)
+                    .take(3),
+            );
+        } else {
+            let x = scale * pixel[0];
+            let y = scale * pixel[1];
+            let u = (x + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
+            let v = (y + 255.0 / 2.0).clamp(0.0, 255.0) as u8;
 
-        // let u = i.rem_euclid(256) as u8;
-        // let v = i.div_euclid(256).rem_euclid(256) as u8;
-        image_data.push(u);
-        image_data.push(v);
-        image_data.push(127);
+            image_data.push(u);
+            image_data.push(v);
+            image_data.push(127);
+        }
     }
     let img = RgbImage::from_vec(1024, 1024, image_data).unwrap();
 
@@ -355,6 +377,7 @@ impl Default for FluidSimulationUniforms {
 
 #[derive(Resource, Clone, ExtractResource)]
 struct FluidSimulationImages {
+    output: Handle<Image>,
     velocity_a: Handle<Image>,
     velocity_b: Handle<Image>,
     divergence: Handle<Image>,
@@ -383,6 +406,8 @@ struct FluidSimulationBindGroups {
     pressure_image: [BindGroup; 2],
 
     gradient_subtraction_image: [BindGroup; 2],
+
+    output_image: BindGroup,
 }
 
 fn prepare_uniforms(
@@ -456,6 +481,7 @@ fn prepare_bind_group(
     let divergence_buffer = gpu_images.get(&fluid_simulation_images.divergence).unwrap();
     let pressure_buffer_a = gpu_images.get(&fluid_simulation_images.pressure_a).unwrap();
     let pressure_buffer_b = gpu_images.get(&fluid_simulation_images.pressure_b).unwrap();
+    let output_buffer = gpu_images.get(&fluid_simulation_images.output).unwrap();
 
     // Advection (Prime -> Off-prime)
     let advection_image_bind_groups = [
@@ -572,6 +598,17 @@ fn prepare_bind_group(
         ),
     ];
 
+    let output_image_bind_groups = render_device.create_bind_group(
+        None,
+        &pipeline.output_image_bind_group_layout,
+        &BindGroupEntries::sequential((
+            &color_buffer_a.texture_view,
+            &velocity_buffer_a.texture_view,
+            &pressure_buffer_b.texture_view,
+            &output_buffer.texture_view,
+        )),
+    );
+
     commands.insert_resource(FluidSimulationBindGroups {
         general_uniform: advection_uniform_bind_group,
         advection_image: advection_image_bind_groups,
@@ -581,6 +618,7 @@ fn prepare_bind_group(
         pressure_uniform: pressure_uniform_bind_group,
         pressure_image: pressure_image_bind_groups,
         gradient_subtraction_image: gradient_subtraction_image_bind_groups,
+        output_image: output_image_bind_groups,
     })
 }
 
@@ -592,6 +630,7 @@ struct FluidSimulationPipeline {
     jacobi_image_bind_group_layout: BindGroupLayout,
     divergence_image_bind_group_layout: BindGroupLayout,
     gradient_subtraction_image_bind_group_layout: BindGroupLayout,
+    output_image_bind_group_layout: BindGroupLayout,
 
     init_pipeline: CachedComputePipelineId,
     advection_pipeline: CachedComputePipelineId,
@@ -599,6 +638,7 @@ struct FluidSimulationPipeline {
     divergence_pipeline: CachedComputePipelineId,
     pressure_pipeline: CachedComputePipelineId,
     gradient_subtraction_pipeline: CachedComputePipelineId,
+    output_pipeline: CachedComputePipelineId,
 }
 
 impl FromWorld for FluidSimulationPipeline {
@@ -623,41 +663,48 @@ impl FromWorld for FluidSimulationPipeline {
         let r_read = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly);
         let r_write = texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly);
 
-        let rg_read =
+        let rgba_read =
             texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadOnly);
-        let rg_write =
+        let rgba_write =
             texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly);
 
         let advection_image_group_layout = render_device.create_bind_group_layout(
             "AdvectionImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (r_read, r_write, rg_read, rg_write, rg_write),
+                (r_read, r_write, rgba_read, rgba_write, rgba_write),
             ),
         );
         let jacobi_image_bind_group_layout = render_device.create_bind_group_layout(
             "JacobiImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (rg_read, rg_read, rg_write),
+                (rgba_read, rgba_read, rgba_write),
             ),
         );
         let divergence_image_bind_group_layout = render_device.create_bind_group_layout(
             "DiffusionImageLayout",
-            &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rg_read, rg_write)),
+            &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rgba_read, rgba_write)),
         );
         let gradient_subtraction_image_bind_group_layout = render_device.create_bind_group_layout(
             "GradientSubtractionImageLayout",
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
-                (rg_read, r_read, rg_read, rg_write, r_write),
+                (rgba_read, r_read, rgba_read, rgba_write, r_write),
             ),
         );
-
+        let output_image_bind_group_layout = render_device.create_bind_group_layout(
+            "OutputImageLayout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (r_read, rgba_read, rgba_read, rgba_write),
+            ),
+        );
         let advection_shader = world.load_asset(ADVECTION_SHADER_ASSET_PATH);
         let jacobi_shader = world.load_asset(JACOBI_SHADER_ASSET_PATH);
         let divergence_shader = world.load_asset(DIVERGENCE_SHADER_ASSET_PATH);
         let gradient_subtraction_shader = world.load_asset(GRADIENT_SUBTRACTION_SHADER_ASSET_PATH);
+        let output_shader = world.load_asset(OUTPUT_SHADER_ASSET_PATH);
 
         let pipeline_cache = world.resource::<PipelineCache>();
         let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -728,6 +775,17 @@ impl FromWorld for FluidSimulationPipeline {
                 shader_defs: vec![],
                 entry_point: Cow::from("gradient_subtraction"),
             });
+        let output_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: None,
+            layout: vec![
+                general_uniform_bind_group_layout.clone(),
+                output_image_bind_group_layout.clone(),
+            ],
+            push_constant_ranges: Vec::new(),
+            shader: output_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Cow::from("output"),
+        });
         FluidSimulationPipeline {
             general_uniform_bind_group_layout,
             advection_image_group_layout,
@@ -735,12 +793,14 @@ impl FromWorld for FluidSimulationPipeline {
             jacobi_uniform_bind_group_layout,
             divergence_image_bind_group_layout,
             gradient_subtraction_image_bind_group_layout,
+            output_image_bind_group_layout,
             init_pipeline,
             advection_pipeline,
             diffusion_pipeline,
             divergence_pipeline,
             pressure_pipeline,
             gradient_subtraction_pipeline,
+            output_pipeline,
         }
     }
 }
@@ -928,6 +988,18 @@ impl render_graph::Node for GameOfLifeNode {
                 pass.set_pipeline(gradient_subtraction_pipeline);
                 pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
                 pass.set_bind_group(1, &bind_groups.gradient_subtraction_image[index], &[]);
+                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                // Output
+                let Some(output_pipeline) =
+                    pipeline_cache.get_compute_pipeline(pipeline.output_pipeline)
+                else {
+                    return Ok(());
+                };
+
+                pass.set_pipeline(output_pipeline);
+                pass.set_bind_group(0, &bind_groups.general_uniform, &[]);
+                pass.set_bind_group(1, &bind_groups.output_image, &[]);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
         }
